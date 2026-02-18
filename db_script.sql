@@ -156,3 +156,148 @@ TABLESPACE pg_default;
 
 ALTER TABLE public.data_rndc_log
     OWNER to postgres;
+
+-- =============================================
+-- Trigger de evaluación automática desde gis_gps
+-- =============================================
+-- Este trigger evalúa si el móvil (placa) entra a zona de cargue o descargue
+-- según la información sincronizada desde RNDC.
+
+ALTER TABLE public.data_rndc
+  ADD COLUMN IF NOT EXISTS salida_descargue timestamp with time zone;
+
+CREATE OR REPLACE FUNCTION public.fn_rndc_haversine_m(
+  lat1 double precision,
+  lon1 double precision,
+  lat2 double precision,
+  lon2 double precision
+)
+RETURNS double precision
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  r double precision := 6371000;
+  dlat double precision;
+  dlon double precision;
+  a double precision;
+  c double precision;
+BEGIN
+  IF lat1 IS NULL OR lon1 IS NULL OR lat2 IS NULL OR lon2 IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  dlat := radians(lat2 - lat1);
+  dlon := radians(lon2 - lon1);
+
+  a := sin(dlat / 2) * sin(dlat / 2)
+       + cos(radians(lat1)) * cos(radians(lat2))
+       * sin(dlon / 2) * sin(dlon / 2);
+  c := 2 * atan2(sqrt(a), sqrt(1 - a));
+
+  RETURN r * c;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.fn_rndc_eval_from_gps()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  rec record;
+  dist_cargue double precision;
+  dist_descargue double precision;
+  dist_umbral_m double precision := 250;
+BEGIN
+  FOR rec IN
+    SELECT d.*
+    FROM data_rndc d
+    WHERE d.numplaca = NEW.gps_vehiculo
+      AND d.estado IN ('NUEVO', 'EN_CARGUE', 'EN_RUTA', 'EN_DESCARGUE')
+    ORDER BY d.server_date DESC
+    LIMIT 20
+  LOOP
+    dist_cargue := public.fn_rndc_haversine_m(
+      NEW.gps_latitud,
+      NEW.gps_longitud,
+      NULLIF(rec.latitudcargue, '')::double precision,
+      NULLIF(rec.longitudcargue, '')::double precision
+    );
+
+    dist_descargue := public.fn_rndc_haversine_m(
+      NEW.gps_latitud,
+      NEW.gps_longitud,
+      NULLIF(rec.latituddescargue, '')::double precision,
+      NULLIF(rec.longituddescargue, '')::double precision
+    );
+
+    IF rec.entrada_cargue IS NULL AND dist_cargue IS NOT NULL AND dist_cargue <= dist_umbral_m THEN
+      UPDATE data_rndc
+      SET entrada_cargue = NEW.gps_tstamp,
+          estado = 'EN_CARGUE',
+          veh_placa = NEW.gps_vehiculo
+      WHERE id = rec.id;
+
+      INSERT INTO data_rndc_log(message, group_id, ingresoidremesa)
+      VALUES (
+        format('Entrada a cargue detectada para placa %s, manifiesto %s, distancia %.2f m', NEW.gps_vehiculo, rec.ingresoidmanifiesto, dist_cargue),
+        1,
+        rec.ingresoidremesa
+      );
+    END IF;
+
+    IF rec.entrada_cargue IS NOT NULL AND rec.salida_cargue IS NULL AND dist_cargue IS NOT NULL AND dist_cargue > dist_umbral_m THEN
+      UPDATE data_rndc
+      SET salida_cargue = NEW.gps_tstamp,
+          estado = 'EN_RUTA',
+          veh_placa = NEW.gps_vehiculo
+      WHERE id = rec.id;
+
+      INSERT INTO data_rndc_log(message, group_id, ingresoidremesa)
+      VALUES (
+        format('Salida de cargue detectada para placa %s, manifiesto %s', NEW.gps_vehiculo, rec.ingresoidmanifiesto),
+        1,
+        rec.ingresoidremesa
+      );
+    END IF;
+
+    IF rec.salida_cargue IS NOT NULL AND rec.entrada_descargue IS NULL AND dist_descargue IS NOT NULL AND dist_descargue <= dist_umbral_m THEN
+      UPDATE data_rndc
+      SET entrada_descargue = NEW.gps_tstamp,
+          estado = 'EN_DESCARGUE',
+          veh_placa = NEW.gps_vehiculo
+      WHERE id = rec.id;
+
+      INSERT INTO data_rndc_log(message, group_id, ingresoidremesa)
+      VALUES (
+        format('Entrada a descargue detectada para placa %s, manifiesto %s, distancia %.2f m', NEW.gps_vehiculo, rec.ingresoidmanifiesto, dist_descargue),
+        1,
+        rec.ingresoidremesa
+      );
+    END IF;
+
+    IF rec.entrada_descargue IS NOT NULL AND rec.salida_descargue IS NULL AND dist_descargue IS NOT NULL AND dist_descargue > dist_umbral_m THEN
+      UPDATE data_rndc
+      SET salida_descargue = NEW.gps_tstamp,
+          estado = 'FINALIZADO',
+          veh_placa = NEW.gps_vehiculo
+      WHERE id = rec.id;
+
+      INSERT INTO data_rndc_log(message, group_id, ingresoidremesa)
+      VALUES (
+        format('Salida de descargue y finalización detectada para placa %s, manifiesto %s', NEW.gps_vehiculo, rec.ingresoidmanifiesto),
+        1,
+        rec.ingresoidremesa
+      );
+    END IF;
+  END LOOP;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_rndc_eval_from_gps ON public.gis_gps;
+
+CREATE TRIGGER trg_rndc_eval_from_gps
+AFTER INSERT ON public.gis_gps
+FOR EACH ROW
+EXECUTE PROCEDURE public.fn_rndc_eval_from_gps();
