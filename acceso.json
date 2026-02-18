@@ -1,0 +1,15 @@
+{
+    "acceso": {
+        "username": "GERENTE@6058",
+        "password": "Gerente6058"
+    },
+    "solicitud": {
+        "tipo": "9",
+        "procesoid": "4"
+    },
+    "documento": {
+        "numidgps": "9004356262",
+        "manifiestos": "nuevos"
+    }
+}
+
